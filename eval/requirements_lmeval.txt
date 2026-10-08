@@ -1,0 +1,6 @@
+# Dependencies for eval/run_lmeval.py (Table 1) and slq_search_tl.py.
+# The *_llama tasks ship with lm_eval under lm_eval/tasks/llama3/instruct;
+# the [ifeval] extra installs langdetect, immutabledict and nltk.
+lm_eval[ifeval]==0.4.11
+vllm==0.21.0
+

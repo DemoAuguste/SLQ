@@ -1,0 +1,23 @@
+# Versions verified with the SLQ pipeline (Python 3.12). transformers >= 5.8 is needed for
+# native Qwen3.5 (qwen3_5) support.
+torch==2.11.0
+transformers==5.8.1
+accelerate==1.12.0
+datasets==3.6.0
+safetensors==0.7.0
+huggingface-hub==1.15.0
+numpy==2.2.6
+tqdm==4.67.1
+
+# ILP solver for the bitwidth allocation.
+ortools==9.15.6755
+
+# Only needed for scripts/run_gptq.sh, which loads the model with
+# --attn_implementation flash_attention_2 (append --attn_implementation sdpa to skip it).
+# flash-attn
+
+# Only needed for serving and eval/run_humming_speedup.py: the Humming kernels
+# (https://github.com/inclusionAI/humming), installed from source.
+
+# Only needed for eval/run_lmeval.py and slq_search_tl.py:
+#   pip install -r eval/requirements_lmeval.txt

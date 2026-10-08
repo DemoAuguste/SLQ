@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the accompanying paper."
+title: "SLQ: Statistically-Lossless Quantization of Large Language Models"
+abstract: >-
+  Reference implementation of SLQ: layer-wise non-uniform asymmetric
+  quantization with multi-bitwidth Shapley sensitivity estimation and
+  ILP-based bitwidth allocation, targeting task-lossless and
+  distribution-lossless (EAR) fidelity.
+authors:
+  - family-names: Helcig
+    given-names: Michael
+    affiliation: ETH Zurich
+  - family-names: Kurtic
+    given-names: Eldar
+    affiliation: Red Hat AI and ISTA
+  - family-names: Alistarh
+    given-names: Dan
+    affiliation: ISTA
+version: "0.1.0"
+repository-code: "https://github.com/IST-DASLab/SLQ"
+preferred-citation:
+  type: conference-paper
+  title: "Statistically-Lossless Quantization of Large Language Models"
+  authors:
+    - family-names: Helcig
+      given-names: Michael
+      affiliation: ETH Zurich
+    - family-names: Kurtic
+      given-names: Eldar
+      affiliation: Red Hat AI and ISTA
+    - family-names: Alistarh
+      given-names: Dan
+      affiliation: ISTA
+  collection-title: "Conference on Language Modeling (COLM)"
+  year: 2026
+  url: "https://openreview.net/forum?id=Xq1atP3a6S"
+  identifiers:
+    - type: url
+      value: "https://arxiv.org/abs/2605.02404"
+      description: "arXiv preprint"
