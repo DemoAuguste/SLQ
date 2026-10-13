@@ -44,12 +44,13 @@ def main():
     if args.calibration_bitwidth not in args.bitwidth_options:
         raise ValueError(f"Calibration bitwidth {args.calibration_bitwidth} is not in bitwidth_options.")
     torch.manual_seed(args.seed)
+    from src.utils.device import device_of, process_group_backend, set_device
     # torchrun sets the env:// rendezvous variables; plain python runs single-process.
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{os.environ['LOCAL_RANK']}"))
+        dist.init_process_group(backend=process_group_backend())
     world_size, rank = dist_utils.get_world_size(), dist_utils.get_rank()
-    device = f"cuda:{rank}"
-    torch.cuda.set_device(device)
+    device = device_of(rank)
+    set_device(rank)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         trust_remote_code=True,

@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-from ortools.linear_solver import pywraplp
 
 from src.data.loading import MASKED_DATASETS, get_data
-from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear
+from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear, prepare_reference
 from src.models.loading import get_tokenizer, load_model
 from src.sensitivity.database import ErrorDatabase, LayerGroup, LinearSensitivityData, ShapleySensitivityData
 from src.utils.common import fix_seed, get_layer_param_counts, set_layer_weights
@@ -22,8 +21,9 @@ from src.utils.weight_store import WeightStore
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-SOLVER_TIME_LIMIT_MS = 600 * 1000
 GUARDRAIL_MAX_DRIFT = 2.0
+# Discretization unit for the knapsack DP budget, in parameter-bits (params x bits).
+_BUDGET_UNIT = 1_000_000
 
 Sensitivity = Union[LinearSensitivityData, ShapleySensitivityData]
 
@@ -87,7 +87,12 @@ def solve_allocation(
     bitwidth_map: Optional[Dict[int, float]] = None,
     layer_groups: Optional[List[LayerGroup]] = None,
 ) -> Dict[str, int]:
-    """Multiple-choice knapsack ILP: one bitwidth per group, average bits <= target."""
+    """Multiple-choice knapsack: one bitwidth per group, average bits <= target, minimizing cost.
+
+    Solved exactly with a DP. The paper formulates this as an ILP, but the multiple-choice
+    knapsack is mathematically identical; a DP avoids the native ortools/SCIP solver, which
+    segfaults on Ascend NPU when co-loaded with torch_npu.
+    """
     bitwidth_map = bitwidth_map or {}
     groups = layer_groups or [LayerGroup(i, [n], n) for i, n in enumerate(error_db.layer_names)]
     tables = [(w, layer_costs(error_db, sens, m))
@@ -96,25 +101,52 @@ def solve_allocation(
     def cost(group, bw):
         return sum(w * t.get(n, {}).get(bw, 0.0) for w, t in tables for n in group.layer_names)
 
-    solver = pywraplp.Solver.CreateSolver('SCIP')
-    solver.SetTimeLimit(SOLVER_TIME_LIMIT_MS)
     params = [sum(error_db.param_counts.get(n, 1) for n in g.layer_names) for g in groups]
-    x = [[solver.BoolVar(f'x_{i}_{j}') for j in range(len(available_bw))] for i in range(len(groups))]
-    for row in x:
-        solver.Add(solver.Sum(row) == 1)
-    solver.Add(solver.Sum(x[i][j] * get_actual_bitwidth(b, bitwidth_map) * params[i]
-                          for i in range(len(groups)) for j, b in enumerate(available_bw))
-               <= target_bitwidth * sum(params))
-    solver.Minimize(solver.Sum(x[i][j] * cost(g, b)
-                               for i, g in enumerate(groups) for j, b in enumerate(available_bw)))
+    total_params = sum(params)
+    budget = target_bitwidth * total_params
+    cap = max(int(budget / _BUDGET_UNIT), 1)
 
-    status = solver.Solve()
-    if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-        raise RuntimeError(f"ILP found no solution at average bitwidth {target_bitwidth:.3f} (status {status})")
-    if status != pywraplp.Solver.OPTIMAL:
-        logger.warning("ILP hit the time limit; using the best feasible solution")
-    return {n: b for i, g in enumerate(groups) for j, b in enumerate(available_bw)
-            if x[i][j].solution_value() > 0.5 for n in g.layer_names}
+    M, B = len(groups), len(available_bw)
+    # integer budget units per (group, bitwidth), and their costs
+    weights = [[int(round(get_actual_bitwidth(b, bitwidth_map) * params[i] / _BUDGET_UNIT))
+                for b in available_bw] for i in range(M)]
+    costs = [[cost(groups[i], b) for b in available_bw] for i in range(M)]
+
+    INF = float('inf')
+    dp = [INF] * (cap + 1)
+    dp[0] = 0.0
+    parents = []
+    for i in range(M):
+        ndp = [INF] * (cap + 1)
+        npar = [None] * (cap + 1)
+        for j in range(cap + 1):
+            c = dp[j]
+            if c == INF:
+                continue
+            for bi in range(B):
+                nj = j + weights[i][bi]
+                if nj > cap:
+                    continue
+                nc = c + costs[i][bi]
+                if nc < ndp[nj]:
+                    ndp[nj] = nc
+                    npar[nj] = (j, bi)
+        dp, parents = ndp, parents + [npar]
+
+    feasible = [j for j in range(cap + 1) if dp[j] != INF]
+    if not feasible:
+        raise RuntimeError(f"knapsack found no feasible allocation at average bitwidth {target_bitwidth:.3f}")
+    best_j = min(feasible, key=lambda j: dp[j])
+
+    alloc: Dict[str, int] = {}
+    j = best_j
+    for i in range(M - 1, -1, -1):
+        prev_j, bi = parents[i][j]
+        b = available_bw[bi]
+        for n in groups[i].layer_names:
+            alloc[n] = b
+        j = prev_j
+    return alloc
 
 
 def predict_metrics_from_config(config: Dict[str, int], error_db: ErrorDatabase,
@@ -175,10 +207,11 @@ def load_measure(args, error_db: ErrorDatabase, top_k: int) -> Callable[[Dict[st
     error_db.param_counts = get_layer_param_counts(model, error_db.layer_names)
     data, masks = load_calibration(args, get_tokenizer(args.model))
     ref_vals, ref_idx = compute_baseline_topk(model, data, args.batch_size, top_k)
+    log_p, p, topk_idx_dev = prepare_reference(ref_vals, ref_idx, next(model.parameters()).device)
 
     def measure(config):
         apply_config(model, config, weight_store)
-        return compute_kl_and_ear(model, ref_vals, ref_idx, data, args.batch_size, masks=masks)[:2]
+        return compute_kl_and_ear(model, log_p, p, topk_idx_dev, data, args.batch_size, masks=masks)[:2]
     return measure
 
 

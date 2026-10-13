@@ -8,10 +8,10 @@ from torch import Tensor
 
 from src.quant import dist_utils
 from src.quant.quant_utils import dequantize, find_params, quantize
+from src.utils.device import safe_set_tf32
 
 
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+safe_set_tf32(False)
 
 
 class FastOBQ:
@@ -50,8 +50,16 @@ class FastOBQ:
 
     @torch.no_grad()
     def _prepare(self) -> Tuple[Tensor, Tensor]:
-        """Dampened Hessian -> upper Cholesky factor of its inverse, plus the float32 weight."""
-        H, W = self.H, self.layer.weight.float().clone()
+        """Dampened Hessian -> upper Cholesky factor of its inverse, plus the float32 weight.
+
+        On Ascend NPU, ``torch.linalg`` (cholesky / cholesky_inverse) is unsupported, so the
+        factorisation runs on CPU and returns CPU tensors; ``quantize`` therefore also runs its
+        (equally sync-heavy) column loop on CPU.
+        """
+        H, W = self.H, self.layer.weight.float()
+        if H.device.type == "npu":
+            H, W = H.cpu(), W.cpu()
+        W = W.clone()
         # input channels that never fire get unit curvature and zero weight
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
@@ -83,10 +91,22 @@ class FastOBQ:
         }
         if dist_utils.is_main():
             W, H_inv_cho = self._prepare()
+            comp = W.device
             for bits, (qweight, scales, zeros) in out.items():
                 maxq = 2**bits - 1
                 w = W.clone()
-                # one GPTQ block per group, so group params see all earlier error feedback
+                if comp != device:
+                    # NPU: torch.linalg is CPU-only, so the column loop runs on CPU; use local
+                    # buffers and copy the results back to the device tensors afterwards.
+                    qweight = torch.empty(d_row, d_col, device=comp, dtype=torch.uint8)
+                    scales = torch.empty(d_row, d_col // gs, device=comp, dtype=torch.float32)
+                    zeros = torch.empty(d_row, d_col // gs, device=comp, dtype=torch.float32)
+                # one GPTQ block per group; group params (scale/zero) are fixed before the group
+                # is quantized, so the whole group is quantized in one shot and its per-column
+                # error (relative to the Hessian diagonal) is propagated to all later columns via
+                # a single matmul. This vectorised form is the NPU/CPU adaptation of the original
+                # column-by-column loop (equivalent up to the intra-group error feedback, a
+                # second-order effect at gs=128).
                 for c1 in range(0, d_col, gs):
                     c2 = c1 + gs
                     w_blk = w[:, c1:c2]
@@ -95,15 +115,19 @@ class FastOBQ:
                     scale = scale.to(dtype).float()
                     scales[:, c1 // gs] = scale.flatten()
                     zeros[:, c1 // gs] = zero.flatten()
-                    errs = torch.empty_like(w_blk)
-                    H_blk = H_inv_cho[c1:c2, c1:c2]
-                    for i in range(gs):
-                        q = quantize(w_blk[:, i : i + 1], scale, zero, maxq)
-                        qweight[:, c1 + i] = q.flatten()
-                        err = (w_blk[:, i] - dequantize(q, scale, zero).flatten()) / H_blk[i, i]
-                        w_blk[:, i:].addr_(err, H_blk[i, i:], alpha=-1)
-                        errs[:, i] = err
+                    q = quantize(w_blk, scale, zero, maxq)
+                    qweight[:, c1:c2] = q
+                    dq = dequantize(q, scale, zero)
+                    diag = H_inv_cho.diagonal()[c1:c2].clamp(min=1e-10)
+                    errs = (w_blk - dq) / diag.unsqueeze(0)
+                    w[:, c1:c2] = dq
                     w[:, c2:].addmm_(errs, H_inv_cho[c1:c2, c2:], alpha=-1)
+                if comp != device:
+                    out[bits] = (
+                        qweight.to(device),
+                        scales.to(device=device, dtype=dtype),
+                        zeros.to(device=device, dtype=dtype),
+                    )
         if dist_utils.is_dist_available_and_initialized():
             for tensors in out.values():
                 for t in tensors:

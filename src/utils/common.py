@@ -9,11 +9,15 @@ import torch.nn as nn
 
 
 def fix_seed(seed: int):
-    """Seed python, numpy and torch; deterministic cuDNN."""
+    """Seed python, numpy and torch; deterministic cuDNN (CUDA only, no-op on NPU/CPU)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
 
 
 def get_layer_weights(model: nn.Module, layer_name: str) -> Optional[torch.Tensor]:

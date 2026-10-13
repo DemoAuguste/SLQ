@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models.loading import load_model, get_tokenizer
 from src.data.loading import get_data
-from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear, compute_perplexity
+from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear, compute_perplexity, prepare_reference
 
 
 def main():
@@ -42,7 +42,8 @@ def main():
         if role == "base":
             topk_vals, topk_idx = compute_baseline_topk(model, input_ids, args.batch_size, args.top_k)
         else:
-            mean_kl, mean_ear, n_tokens = compute_kl_and_ear(model, topk_vals, topk_idx, input_ids, args.batch_size)
+            log_p, p, topk_idx_dev = prepare_reference(topk_vals, topk_idx, next(model.parameters()).device)
+            mean_kl, mean_ear, n_tokens = compute_kl_and_ear(model, log_p, p, topk_idx_dev, input_ids, args.batch_size)
         if args.compute_ppl:
             ppl[role] = compute_perplexity(model, data, args.batch_size)[:2]
         del model

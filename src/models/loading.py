@@ -7,13 +7,25 @@ import torch
 
 
 def load_model(model_path: str, dtype: str = "bfloat16", device_map="balanced"):
-    """Causal LM in eval mode with the KV cache off, dispatched across visible GPUs by accelerate."""
+    """Causal LM in eval mode with the KV cache off.
+
+    On CUDA the model is dispatched across visible GPUs via accelerate's device_map; on Ascend
+    NPU (where accelerate's device_map is CUDA-oriented) it loads to CPU then moves to one NPU.
+    """
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype=getattr(torch, dtype), device_map=device_map,
-        trust_remote_code=True, low_cpu_mem_usage=True,
-    )
+    from src.utils.device import device_type
+
+    if device_type() == "npu":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=getattr(torch, dtype), trust_remote_code=True, low_cpu_mem_usage=True,
+        )
+        model = model.to("npu:0")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=getattr(torch, dtype), device_map=device_map,
+            trust_remote_code=True, low_cpu_mem_usage=True,
+        )
     model.config.use_cache = False
     return model.eval()
 

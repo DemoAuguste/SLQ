@@ -17,13 +17,14 @@ import torch
 from tqdm import tqdm
 
 from src.data.loading import MASKED_DATASETS, get_data
-from src.metrics.evaluation import compute_all_metrics, compute_baseline_topk
+from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear, prepare_reference
 from src.models.grouping import build_layer_groups, parse_group_spec
 from src.models.loading import get_tokenizer, load_model
 from src.sensitivity.database import ErrorDatabase, LayerGroup, LinearSensitivityData, ShapleySensitivityData
 from src.utils.common import compute_layer_error, fix_seed, get_layer_weights, set_layer_weights
 from src.utils.gpu_cache import GPUWeightCache
 from src.utils.weight_store import WeightStore
+from src.utils.device import empty_cache
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -71,8 +72,15 @@ def estimate_linear_alphas(model, original_weights: Dict[str, torch.Tensor], gro
 
 
 def estimate_shapley_values(model, gpu_cache, groups: List[LayerGroup], bitwidths: List[int],
-                            metric_fn, num_permutations: int = 50) -> np.ndarray:
-    """Algorithm 1: [3 (NLL, KL, EAR), groups, bitwidths] Shapley values; the b_max column stays zero."""
+                            metric_fn, num_permutations: int = 50,
+                            rank: int | None = None, world_size: int | None = None) -> np.ndarray:
+    """Algorithm 1: [3 (NLL, KL, EAR), groups, bitwidths] Shapley values; the b_max column stays zero.
+
+    The permutation games are independent, so they can be sharded across processes: with a `rank`
+    and `world_size`, this process only evaluates permutations `p` where `p % world_size == rank`.
+    Each shard already divides by the full `num_permutations`, so summing shards reproduces the
+    exact single-process result.
+    """
     max_bw = max(bitwidths)
     shapley = np.zeros((3, len(groups), len(bitwidths)))
     sign = np.array([1.0, 1.0, -1.0])
@@ -80,7 +88,11 @@ def estimate_shapley_values(model, gpu_cache, groups: List[LayerGroup], bitwidth
     for level_idx, target_bw in enumerate(bitwidths):
         if target_bw == max_bw:
             continue
-        for _ in tqdm(range(num_permutations), desc=f"Permutations ({max_bw}->{target_bw} bit)"):
+        perms = list(range(num_permutations))
+        if world_size and world_size > 1:
+            perms = [p for p in perms if p % world_size == rank]
+        suffix = f" [rank {rank}/{world_size}]" if (world_size and world_size > 1) else ""
+        for p in tqdm(perms, desc=f"Permutations ({max_bw}->{target_bw} bit){suffix}"):
             perm = np.random.permutation(len(groups))
             gpu_cache.swap_all_layers(model, {n: max_bw for g in groups for n in g.layer_names})
             prev = np.array(metric_fn())
@@ -90,7 +102,7 @@ def estimate_shapley_values(model, gpu_cache, groups: List[LayerGroup], bitwidth
                 cur = np.array(metric_fn())
                 shapley[:, g_idx, level_idx] += sign * (cur - prev) / num_permutations
                 prev = cur
-            torch.cuda.empty_cache()
+            empty_cache()
 
     return shapley
 
@@ -108,6 +120,32 @@ def save_json(data, filepath: Path):
     logger.info(f"Saved {filepath}")
 
 
+def merge_shapley(args, layer_dir: Path, bitwidths: List[int], tag: str,
+                  group_suffix: str, shapley_path: Path):
+    """Sum the per-rank partial Shapley shards into the final ShapleySensitivityData json."""
+    error_db = ErrorDatabase.load(str(layer_dir / "error_db.json"))
+    group_patterns = parse_group_spec(args.layer_groups) if args.layer_groups.strip() else []
+    groups = build_layer_groups(error_db.layer_names, group_patterns)
+    meta = dict(layer_names=error_db.layer_names, top_k=args.top_k,
+                calibration_dataset=args.calibration_data, calibration_samples=args.calibration_samples,
+                seed=args.seed, per_layer_normalized=True,
+                layer_groups=[asdict(g) for g in groups] if group_patterns else None)
+
+    partials = sorted(layer_dir.glob(f"shapley_partial_*_seed{args.seed}_rank*.npy"))
+    if len(partials) != args.shapley_world_size:
+        raise RuntimeError(f"expected {args.shapley_world_size} partial shards, found {len(partials)}: {partials}")
+    total = np.zeros((3, len(groups), len(bitwidths)))
+    for fp in partials:
+        total += np.load(str(fp))
+    nll_s, kl_s, ear_s = total[0], total[1], total[2]
+    save_json(ShapleySensitivityData(
+        nll_shapley_values=nll_s, kl_shapley_values=kl_s, ear_shapley_values=ear_s,
+        nll_shapley_per_level=per_layer_values(nll_s, groups, bitwidths),
+        kl_shapley_per_level=per_layer_values(kl_s, groups, bitwidths),
+        ear_shapley_per_level=per_layer_values(ear_s, groups, bitwidths),
+        bitwidths=bitwidths, num_permutations=args.num_permutations, **meta), shapley_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build sensitivity databases")
     parser.add_argument('--model', type=str, required=True)
@@ -123,6 +161,12 @@ def main():
     parser.add_argument('--skip-linear', action='store_true')
     parser.add_argument('--shapley-bitwidths', type=str, default='2,3,4,5,6,7,8')
     parser.add_argument('--num-permutations', type=int, default=50)
+    parser.add_argument('--shapley-rank', type=int, default=None,
+                        help="Shard index for parallel Shapley estimation (0-based)")
+    parser.add_argument('--shapley-world-size', type=int, default=1,
+                        help="Number of Shapley shards (processes) across which permutations are split")
+    parser.add_argument('--merge-shapley', action='store_true',
+                        help="Merge per-rank partial Shapley shards into the final database and exit")
     parser.add_argument('--skip-shapley', action='store_true')
     parser.add_argument('--layer-groups', type=str,
                         default='mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj',
@@ -143,6 +187,10 @@ def main():
     linear_path = layer_dir / f"linear_{tag}_{args.num_noise_samples}noise{group_suffix}_seed{args.seed}.json"
     shapley_path = layer_dir / (f"shapley_{tag}_{args.num_permutations}perms_bw{'-'.join(map(str, bitwidths))}"
                                 f"{group_suffix}_seed{args.seed}.json")
+
+    if args.merge_shapley:
+        merge_shapley(args, layer_dir, bitwidths, tag, group_suffix, shapley_path)
+        return
 
     weight_store = WeightStore(str(layer_dir)).load()
     model = load_model(args.model)
@@ -169,8 +217,15 @@ def main():
         topk_vals, topk_idx = compute_baseline_topk(model, calibration_data, args.batch_size, args.top_k)
         torch.save({'topk_vals': topk_vals, 'topk_idx': topk_idx}, str(baseline_path))
 
+    log_p, p, topk_idx_dev = prepare_reference(topk_vals, topk_idx, next(model.parameters()).device)
+
     def metric_fn():
-        return compute_all_metrics(model, calibration_data, topk_vals, topk_idx, args.batch_size, masks=masks)
+        # Paper Algorithm 1 evaluates KL and EAR (NLL is a separate diagnostic, unused by the
+        # TL/DL searches); skipping the full-vocab NLL cross-entropy avoids the NPU vector-core
+        # timeout and is substantially cheaper. NLL is stubbed to 0 in the returned triple.
+        kl, ear, _ = compute_kl_and_ear(model, log_p, p, topk_idx_dev, calibration_data,
+                                        args.batch_size, masks=masks)
+        return np.array([0.0, kl, ear])
 
     group_patterns = parse_group_spec(args.layer_groups) if use_grouping else []
     groups = build_layer_groups(error_db.layer_names, group_patterns)
@@ -190,13 +245,21 @@ def main():
         gpu_cache = GPUWeightCache(model, weight_store, bitwidths, cache=args.gpu_cache != 'off',
                                    preload=args.gpu_cache == 'eager')
         nll_s, kl_s, ear_s = estimate_shapley_values(model, gpu_cache, groups, bitwidths, metric_fn,
-                                                     args.num_permutations)
-        save_json(ShapleySensitivityData(
-            nll_shapley_values=nll_s, kl_shapley_values=kl_s, ear_shapley_values=ear_s,
-            nll_shapley_per_level=per_layer_values(nll_s, groups, bitwidths),
-            kl_shapley_per_level=per_layer_values(kl_s, groups, bitwidths),
-            ear_shapley_per_level=per_layer_values(ear_s, groups, bitwidths),
-            bitwidths=bitwidths, num_permutations=args.num_permutations, **meta), shapley_path)
+                                                     args.num_permutations, args.shapley_rank,
+                                                     args.shapley_world_size)
+        if args.shapley_world_size > 1:
+            partial_path = layer_dir / (f"shapley_partial_{tag}_{args.num_permutations}perms_bw"
+                                        f"{'-'.join(map(str, bitwidths))}{group_suffix}_seed{args.seed}"
+                                        f"_rank{args.shapley_rank}.npy")
+            np.save(str(partial_path), np.stack([nll_s, kl_s, ear_s]))
+            logger.info(f"Saved partial Shapley shard {partial_path}")
+        else:
+            save_json(ShapleySensitivityData(
+                nll_shapley_values=nll_s, kl_shapley_values=kl_s, ear_shapley_values=ear_s,
+                nll_shapley_per_level=per_layer_values(nll_s, groups, bitwidths),
+                kl_shapley_per_level=per_layer_values(kl_s, groups, bitwidths),
+                ear_shapley_per_level=per_layer_values(ear_s, groups, bitwidths),
+                bitwidths=bitwidths, num_permutations=args.num_permutations, **meta), shapley_path)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from src.quant.fast_obq import FastOBQ
 from src.quant.model_utils import ForwardInterrupt, InputCollector, select_layers, to
 from src.quant.qparams import save_qparams
 from src.quant.quant_utils import QLinear
+from src.utils.device import empty_cache
 
 
 def _barrier():
@@ -97,7 +98,7 @@ class Quantizer:
             if self.cpu_offload_modules:
                 block.cpu()
             del handles
-            torch.cuda.empty_cache()
+            empty_cache()
 
         if use_cache is not None:
             self.model.config.use_cache = use_cache

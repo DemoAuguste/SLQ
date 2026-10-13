@@ -19,7 +19,7 @@ from slq_build_checkpoint import parse_config_file
 from slq_search_dl import apply_config, compute_avg_bitwidth, load_calibration, parse_bitwidth_map
 from src.models.loading import load_model, get_tokenizer
 from src.utils.common import fix_seed, get_layer_param_counts
-from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear
+from src.metrics.evaluation import compute_baseline_topk, compute_kl_and_ear, prepare_reference
 from src.utils.weight_store import WeightStore
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -70,6 +70,7 @@ def main():
     baseline_topk_vals, baseline_topk_idx = compute_baseline_topk(
         model, calibration_data, args.batch_size, args.top_k
     )
+    log_p, p, topk_idx_dev = prepare_reference(baseline_topk_vals, baseline_topk_idx, next(model.parameters()).device)
 
     results = []
     for name, config in configs_to_eval:
@@ -77,7 +78,7 @@ def main():
 
         apply_config(model, config, weight_store)
         kl, ear, _ = compute_kl_and_ear(
-            model, baseline_topk_vals, baseline_topk_idx,
+            model, log_p, p, topk_idx_dev,
             calibration_data, args.batch_size, masks=calibration_masks
         )
 

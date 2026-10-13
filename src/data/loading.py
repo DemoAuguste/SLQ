@@ -22,7 +22,7 @@ def _ids(tokenizer, text: str) -> torch.Tensor:
 
 def get_wikitext2(num_samples, seq_length, tokenizer, train=True, seed=42) -> List[torch.Tensor]:
     """Random train windows, or the contiguous test split chunked into seq_length."""
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train" if train else "test")
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train" if train else "test")
     tokens = _ids(tokenizer, "\n\n".join(dataset["text"]))
     if not train:
         return [tokens[:, i:i + seq_length] for i in range(0, tokens.shape[1] - seq_length + 1, seq_length)]
@@ -121,7 +121,7 @@ def _tokenize_chat_pairs(
 
 def get_gsm8k(num_samples, seq_length, tokenizer, train=True, seed=42):
     """GSM8K in chat format with answer-only masks."""
-    dataset = load_dataset("gsm8k", "main", split="train" if train else "test").shuffle(seed=seed)
+    dataset = load_dataset("openai/gsm8k", "main", split="train" if train else "test").shuffle(seed=seed)
     return _tokenize_chat_pairs(((s["question"], s["answer"]) for s in dataset), num_samples, seq_length, tokenizer)
 
 
