@@ -72,9 +72,14 @@ def extract_layer_groups(sens: Sensitivity) -> Optional[List[LayerGroup]]:
 def layer_costs(error_db: ErrorDatabase, sens: Sensitivity, metric: str) -> Dict[str, Dict[int, float]]:
     """Per-layer cost table c[name][bw] for metric 'kl' or 'ear' (EAR loss)."""
     if isinstance(sens, ShapleySensitivityData):
-        return getattr(sens, f'{metric}_shapley_per_level') or {}
-    alphas = getattr(sens, f'{metric}_alphas')
-    return {n: {b: e * alphas.get(n, 0.0) for b, e in errs.items()} for n, errs in error_db.layers.items()}
+        table = getattr(sens, f'{metric}_shapley_per_level') or {}
+    else:
+        alphas = getattr(sens, f'{metric}_alphas')
+        table = {n: {b: e * alphas.get(n, 0.0) for b, e in errs.items()}
+                 for n, errs in error_db.layers.items()}
+    # KL / EAR-loss costs are physically non-negative; clip Monte-Carlo noise from the Shapley
+    # estimator so the exact knapsack solver never exploits spurious negative costs.
+    return {n: {b: max(0.0, v) for b, v in bv.items()} for n, bv in table.items()}
 
 
 def solve_allocation(
