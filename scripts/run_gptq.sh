@@ -17,7 +17,7 @@ SAVE_DIR="${2:?usage: $0 <model_id> <save_dir> [num_gpus] [extra args]}"
 NUM_GPUS="${3:-8}"
 shift $(( $# < 3 ? $# : 3 ))
 
-CALIB_DATA="fineweb_edu"
+CALIB_DATA="${CALIB_DATA:-fineweb_edu}"
 SEQ_LEN=8192
 NUM_TOKENS=$((1024 * 8192))
 BITS_LIST="2 3 4 5 6 7 8"
