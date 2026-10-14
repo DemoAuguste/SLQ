@@ -46,6 +46,6 @@ torchrun --nnodes=1 --nproc-per-node="${NUM_GPUS}" --master_port 29501 slq_quant
     --cpu_offload_modules \
     --cpu_offload_activations \
     --dtype                bfloat16 \
-    --attn_implementation  flash_attention_2 \
+    --attn_implementation  "${ATTN_IMPL:-flash_attention_2}" \
     --save_dir             "${SAVE_DIR}" \
     "$@"
