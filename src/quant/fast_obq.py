@@ -52,10 +52,12 @@ class FastOBQ:
     def _prepare(self) -> Tuple[Tensor, Tensor]:
         """Dampened Hessian -> upper Cholesky factor of its inverse, plus the float32 weight.
 
-        On Ascend NPU, ``torch.linalg`` (cholesky / cholesky_inverse) is unsupported, so the
-        factorisation runs on CPU and returns CPU tensors; ``quantize`` therefore also runs its
-        (equally sync-heavy) column loop on CPU.
+        On Ascend NPU ``torch.linalg`` (cholesky / cholesky_inverse) is unsupported, so the
+        factorisation runs on CPU (as in AMCT's GPTQ); the factor and weight are then moved
+        back to the layer device so the quantization loop's error-feedback GEMMs run on the
+        accelerator rather than on CPU.
         """
+        device = self.layer.weight.device
         H, W = self.H, self.layer.weight.float()
         if H.device.type == "npu":
             H, W = H.cpu(), W.cpu()
@@ -71,7 +73,8 @@ class FastOBQ:
         H[:, zero_cols] = 0
         H[zero_cols, zero_cols] = 1
         H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        return W, torch.linalg.cholesky(H_inv, upper=True)
+        H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
+        return W.to(device), H_inv_cho.to(device)
 
     @torch.no_grad()
     def quantize(self) -> Dict[int, Tuple[Tensor, Tensor, Tensor]]:
@@ -91,20 +94,13 @@ class FastOBQ:
         }
         if dist_utils.is_main():
             W, H_inv_cho = self._prepare()
-            comp = W.device
             for bits, (qweight, scales, zeros) in out.items():
                 maxq = 2**bits - 1
                 w = W.clone()
-                if comp != device:
-                    # NPU: torch.linalg is CPU-only, so the column loop runs on CPU; use local
-                    # buffers and copy the results back to the device tensors afterwards.
-                    qweight = torch.empty(d_row, d_col, device=comp, dtype=torch.uint8)
-                    scales = torch.empty(d_row, d_col // gs, device=comp, dtype=torch.float32)
-                    zeros = torch.empty(d_row, d_col // gs, device=comp, dtype=torch.float32)
                 # one GPTQ block per group; group params (scale/zero) are fixed before the group
                 # is quantized, so the whole group is quantized in one shot and its per-column
                 # error (relative to the Hessian diagonal) is propagated to all later columns via
-                # a single matmul. This vectorised form is the NPU/CPU adaptation of the original
+                # a single matmul. This vectorised form is the NPU/CUDA adaptation of the original
                 # column-by-column loop (equivalent up to the intra-group error feedback, a
                 # second-order effect at gs=128).
                 for c1 in range(0, d_col, gs):
@@ -122,12 +118,6 @@ class FastOBQ:
                     errs = (w_blk - dq) / diag.unsqueeze(0)
                     w[:, c1:c2] = dq
                     w[:, c2:].addmm_(errs, H_inv_cho[c1:c2, c2:], alpha=-1)
-                if comp != device:
-                    out[bits] = (
-                        qweight.to(device),
-                        scales.to(device=device, dtype=dtype),
-                        zeros.to(device=device, dtype=dtype),
-                    )
         if dist_utils.is_dist_available_and_initialized():
             for tensors in out.values():
                 for t in tensors:
