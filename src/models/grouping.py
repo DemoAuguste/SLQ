@@ -5,7 +5,9 @@ from typing import Dict, List, Tuple
 
 from src.sensitivity.database import LayerGroup
 
-_BLOCK = re.compile(r'model\.layers\.(\d+)\.')
+# Generic block regex: matches both `model.layers.N.` (dense) and the nested
+# `model.language_model.layers.N.` used by VLM/hybrid checkpoints (Qwen3.5).
+_BLOCK = re.compile(r'\.layers\.(\d+)\.')
 
 
 def parse_group_spec(group_spec: str) -> List[List[str]]:
