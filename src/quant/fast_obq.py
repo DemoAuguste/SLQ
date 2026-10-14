@@ -61,6 +61,10 @@ class FastOBQ:
         H, W = self.H, self.layer.weight.float()
         if H.device.type == "npu":
             H, W = H.cpu(), W.cpu()
+            # torch defaults to all CPU cores (192 here), which oversubscribes these layer-sized
+            # factorisations; measured optimum is ~16 threads for <=8k dims and ~48 for the 17k
+            # MLP down-projection Hessian.
+            torch.set_num_threads(48 if self.d_col > 8192 else 16)
         W = W.clone()
         # input channels that never fire get unit curvature and zero weight
         dead = torch.diag(H) == 0
