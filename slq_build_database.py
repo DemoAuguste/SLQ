@@ -203,6 +203,19 @@ def main():
         data, masks = data
         masks = torch.cat(masks, dim=0)
     calibration_data = torch.cat(data, dim=0)
+    # 防御：若加载器未按 seq_length 切窗，会得到 [1, 全语料长度] 的超长序列，
+    # 直接前向必然 NPU OOM。这里强制规整为 [N, seq_len] 的定长块。
+    if calibration_data.dim() == 1:
+        calibration_data = calibration_data.unsqueeze(0)
+    max_len = min(args.calibration_seq_length,
+                  int(getattr(model.config, "max_position_embeddings", args.calibration_seq_length)
+                      or args.calibration_seq_length))
+    if calibration_data.shape[1] > max_len:
+        total = calibration_data.shape[1] - calibration_data.shape[1] % max_len
+        calibration_data = calibration_data[:, :total].reshape(-1, max_len)[:args.calibration_samples]
+        logger.info(f"re-chunked calibration_data -> {tuple(calibration_data.shape)}")
+    assert calibration_data.dim() == 2 and calibration_data.shape[1] <= max_len, \
+        f"unexpected calibration_data shape {tuple(calibration_data.shape)}"
 
     if error_db_path.exists() and not args.force_recompute:
         error_db = ErrorDatabase.load(str(error_db_path))
